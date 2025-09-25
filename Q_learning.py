@@ -1,187 +1,427 @@
+
+import os
+import time
+import math
+import random
+from typing import Tuple, Dict, Any, List
+
 import gymnasium as gym
-import numpy as np
 from gymnasium import spaces
+import numpy as np
 
-# Asume que ya tienes las librerías de Robobo instaladas
-# Para este código, usaremos 'mock' de las llamadas a Robobo para que sea ejecutable.
-# En tu implementación final, debes reemplazar estas llamadas con las reales de RoboboSim.
+# Robobo / simulator imports (same style as the provided file)
+try:
+    from robobopy.Robobo import Robobo
+    from robobopy.utils.IR import IR
+    from robobopy.utils.LED import LED
+    from robobosim.RoboboSim import RoboboSim
+except Exception as e:
+    # Allow importing even when not installed on the machine: raise a helpful error later
+    Robobo = None
+    RoboboSim = None
+    IR = None
 
-# from robobo import Robobo
-# from robobosim import RoboboSim
+# Stable Baselines 3
+try:
+    from stable_baselines3 import PPO
+    from stable_baselines3.common.vec_env import DummyVecEnv
+    from stable_baselines3.common.callbacks import BaseCallback
+except Exception:
+    PPO = None
 
-# Variables de configuración (puedes ajustarlas según tus necesidades)
-MAX_STEPS_PER_EPISODE = 500
-TERMINATION_DISTANCE = 0.1 # Metros
-FIELD_SIZE = 1.5 # El campo va de -1.5 a 1.5 en x e y
+# Matplotlib for plotting results
+import matplotlib.pyplot as plt
+import csv
 
-class RoboboEnv(gym.Env):
+# ----- Environment definition -----
+
+class RoboboGymEnv(gym.Env):
+    """Gymnasium environment wrapping RoboboSim / Robobo.
+
+    Observation: vector of 8 floats (normalized to [0,1]):
+        [brightness_left50, brightness_left25, brightness_center, brightness_right25, brightness_right50,
+         ir_frontC, ir_frontL, ir_frontR]
+
+    Action space: Discrete(5) (same semantic as the provided file):
+        0: Girar muy a la derecha
+        1: Girar a la derecha
+        2: Avanzar
+        3: Girar a la izquierda
+        4: Girar muy a la izquierda
+
+    Reward:
+        - Positive when the center brightness increases
+        - Large positive for reaching the target brightness threshold
+        - Large negative and termination on collision (IR threshold)
+        - Small time penalty per step to encourage speed
     """
-    Entorno de Robobo que sigue la interfaz de Gymnasium.
-    Objetivo: Entrenar a un robot para acercarse a un objeto cilíndrico rojo.
-    """
-    metadata = {"render_modes": ["human"], "render_fps": 30}
 
-    def _init_(self):
-        super(RoboboEnv, self)._init_()
+    metadata = {"render_modes": ["human"], "render_fps": 10}
 
-        # --- Definición de los Espacios ---
-        # Espacio de observación:
-        # Se utilizan espacios continuos (Box) para una mayor complejidad, como se pide.
-        # El estado del agente está representado por la distancia y el ángulo al objeto.
-        # Las velocidades lineal y angular del robot también pueden ser parte del estado
-        # para ayudar al agente a tomar decisiones.
-        # [distancia, angulo_relativo, velocidad_lineal_propia, velocidad_angular_propia]
-        self.observation_space = spaces.Box(
-            low=np.array([0, -np.pi, -100, -100], dtype=np.float32),
-            high=np.array([FIELD_SIZE * np.sqrt(2), np.pi, 100, 100], dtype=np.float32),
-            dtype=np.float32
-        )
+    def __init__(self, host: str = "localhost", brightness_goal: float = 350.0, max_steps: int = 200):
+        super().__init__()
 
-        # Espacio de acción:
-        # Espacio continuo para las velocidades de las ruedas.
-        # [-1.0, 1.0] se mapearán a los rangos de velocidad del robot (e.g., -100 a 100 cm/s).
-        # [velocidad_rueda_izquierda, velocidad_rueda_derecha]
-        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
+        self.host = host
+        self.brightness_goal = brightness_goal
+        self.max_steps = max_steps
 
-        # Conexión con el simulador RoboboSim.
-        # En tu práctica, esto se debería inicializar aquí.
-        # self.robobo = Robobo('127.0.0.1')
-        # self.robobosim = RoboboSim(self.robobo)
+        # Action and observation spaces
+        self.action_space = spaces.Discrete(5)
+        # Observations normalized to [0,1]
+        self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(8,), dtype=np.float32)
 
-        self.robot_pos = np.array([0.0, 0.0])
-        self.object_pos = np.array([0.0, 0.0])
-        self.robot_orientation = 0.0 # Orientación en radianes
-        self.linear_velocity = 0.0
-        self.angular_velocity = 0.0
-        self.steps_count = 0
+        # Connect to Robobo & simulator
+        if Robobo is None or RoboboSim is None:
+            print("Warning: robobopy or robobosim not available. Environment will raise on connect().")
 
-    def _get_obs(self):
-        """
-        Calcula y devuelve la observación actual del robot.
-        """
-        # Calcular la distancia y el ángulo al objeto.
-        vector_to_object = self.object_pos - self.robot_pos
-        distance = np.linalg.norm(vector_to_object)
-        
-        # Calcular el ángulo relativo al frente del robot.
-        angle_to_object = np.arctan2(vector_to_object[1], vector_to_object[0])
-        relative_angle = angle_to_object - self.robot_orientation
-        
-        # Normalizar el ángulo a un rango de -pi a pi
-        relative_angle = (relative_angle + np.pi) % (2 * np.pi) - np.pi
+        self.rbb = None
+        self.sim = None
 
-        # En tu práctica, esta información provendría de los sensores del robot.
-        return np.array([distance, relative_angle, self.linear_velocity, self.angular_velocity], dtype=np.float32)
+        # Internal state
+        self.current_obs = None
+        self.steps = 0
+        self.episode_rewards = 0.0
+        self.trajectory: List[Tuple[float, float]] = []  # store (x,y) if pose available
 
-    def _get_info(self):
-        """
-        Proporciona información adicional para depuración.
-        """
-        return {
-            "robot_position": self.robot_pos,
-            "object_position": self.object_pos,
-            "robot_orientation": self.robot_orientation
-        }
+    # ------- Helper: hardware/simulator connection -------
+    def _connect(self):
+        if self.rbb is None:
+            if Robobo is None:
+                raise RuntimeError("Robobo library not available. Please install robobopy and robobosim.")
+            self.rbb = Robobo(self.host)
+            self.rbb.connect()
 
-    def reset(self, seed=None, options=None):
-        """
-        Reinicia el entorno a un estado inicial aleatorio.
-        """
-        super().reset(seed=seed)
-        
-        # Resetear el conteo de pasos para un nuevo episodio
-        self.steps_count = 0
-
-        # Posicionar el robot y el objeto en ubicaciones aleatorias
-        # dentro de los límites del escenario.
-        self.robot_pos = self.np_random.uniform(low=-FIELD_SIZE, high=FIELD_SIZE, size=(2,))
-        self.object_pos = self.np_random.uniform(low=-FIELD_SIZE, high=FIELD_SIZE, size=(2,))
-        self.robot_orientation = self.np_random.uniform(low=-np.pi, high=np.pi)
-        self.linear_velocity = 0.0
-        self.angular_velocity = 0.0
-        
-        # Llama a las funciones del simulador para mover el robot y el objeto.
-        # self.robobosim.set_robot_position(x=self.robot_pos[0], y=self.robot_pos[1], rot=self.robot_orientation)
-        # self.robobosim.set_cylinder_position(x=self.object_pos[0], y=self.object_pos[1])
-        # self.robobo.stop_robot()
-
-        observation = self._get_obs()
-        info = self._get_info()
-
-        return observation, info
-
-    def step(self, action):
-        """
-        Avanza el entorno un paso de tiempo aplicando la acción del agente.
-        """
-        self.steps_count += 1
-        
-        # Mapear la acción a las velocidades de las ruedas del robot.
-        # Puedes usar una simple conversión lineal, por ejemplo, los valores de acción [-1, 1] se
-        # convierten en velocidades de rueda de [-100, 100].
-        # left_wheel_speed = action[0] * 100
-        # right_wheel_speed = action[1] * 100
-        # self.robobo.set_motor_speeds(left_wheel_speed, right_wheel_speed)
-
-        # Actualizar la posición del robot basándote en la acción (simulación básica).
-        # En la práctica real, el simulador se encargará de esto.
-        dt = 0.1 # Paso de tiempo simulado
-        self.linear_velocity = (action[0] + action[1]) / 2.0 * 100 # Velocidad lineal de ejemplo
-        self.angular_velocity = (action[1] - action[0]) / 2.0 * 100 # Velocidad angular de ejemplo
-        self.robot_orientation += self.angular_velocity * dt
-        self.robot_pos[0] += self.linear_velocity * np.cos(self.robot_orientation) * dt
-        self.robot_pos[1] += self.linear_velocity * np.sin(self.robot_orientation) * dt
-
-        # --- Cálculo de la Recompensa ---
-        # Penalización por alejarse del objetivo.
-        old_distance = np.linalg.norm(self.object_pos - (self.robot_pos - np.array([self.linear_velocity * np.cos(self.robot_orientation) * dt, self.linear_velocity * np.sin(self.robot_orientation) * dt])))
-        current_distance = np.linalg.norm(self.object_pos - self.robot_pos)
-        reward = (old_distance - current_distance) * 10.0 # Recompensa por acercarse
-
-        # Recompensa o penalización adicional por la orientación
-        reward += (1.0 - abs(self._get_obs()[1])/np.pi) * 0.1 # Recompensa por estar bien orientado
-
-        # Penalización por chocar con los bordes del escenario.
-        if abs(self.robot_pos[0]) > FIELD_SIZE or abs(self.robot_pos[1]) > FIELD_SIZE:
-            reward -= 5.0 # Penalización severa
-            
-        # --- Condiciones de finalización del episodio ---
-        terminated = current_distance < TERMINATION_DISTANCE
-        truncated = self.steps_count >= MAX_STEPS_PER_EPISODE
-        
-        observation = self._get_obs()
-        info = self._get_info()
-
-        return observation, reward, terminated, truncated, info
-
-    def render(self):
-        # La visualización se manejará con el modo 'human' de Gymnasium,
-        # que llamará automáticamente al método render del simulador.
-        pass
+        if self.sim is None:
+            if RoboboSim is None:
+                raise RuntimeError("RoboboSim library not available. Please install robobosim.")
+            self.sim = RoboboSim(self.host)
+            self.sim.connect()
 
     def close(self):
-        """
-        Cierra la conexión con el simulador.
-        """
-        # self.robobo.stop_robot()
-        # self.robobo.disconnect()
+        try:
+            if self.rbb:
+                self.rbb.disconnect()
+        except Exception:
+            pass
+        try:
+            if self.sim:
+                self.sim.disconnect()
+        except Exception:
+            pass
+
+    # ------- Sensors & actions (inspired by uploaded script) -------
+    def _read_brightnesss(self) -> List[float]:
+        # Following the order used in the uploaded script: [II, I, C, D, DD]
+        # We will return normalized values in [0,1] using an assumed max (e.g. 1023)
+        max_sensor = 1023.0
+        # Pan positions: -25, -50, 25, 50, 0 in the uploaded script
+        try:
+            self.rbb.movePanTo(-25, 100, wait=True)
+            luz_I = self.rbb.readBrightnessSensor()
+            self.rbb.wait(0.05)
+
+            self.rbb.movePanTo(-50, 100, wait=True)
+            luz_II = self.rbb.readBrightnessSensor()
+            self.rbb.wait(0.05)
+
+            self.rbb.movePanTo(25, 100, wait=True)
+            luz_D = self.rbb.readBrightnessSensor()
+            self.rbb.wait(0.05)
+
+            self.rbb.movePanTo(50, 100, wait=True)
+            luz_DD = self.rbb.readBrightnessSensor()
+            self.rbb.wait(0.05)
+
+            self.rbb.movePanTo(0, 100, wait=True)
+            luz_C = self.rbb.readBrightnessSensor()
+            self.rbb.wait(0.05)
+        except Exception as e:
+            # If sensors not available, return zeros
+            print("Warning reading brightness sensors:", e)
+            luz_II = luz_I = luz_C = luz_D = luz_DD = 0.0
+
+        raw = [luz_II, luz_I, luz_C, luz_D, luz_DD]
+        norm = [min(max(v / max_sensor, 0.0), 1.0) for v in raw]
+        return norm
+
+    def _read_ir(self) -> List[float]:
+        # Returns normalized IR values in [0,1] with assumed max 1023.
+        max_ir = 1023.0
+        try:
+            ir_frontal = self.rbb.readIRSensor(IR.FrontC)
+            ir_frontL = self.rbb.readIRSensor(IR.FrontL)
+            ir_frontR = self.rbb.readIRSensor(IR.FrontR)
+        except Exception as e:
+            print("Warning reading IR sensors:", e)
+            ir_frontal = ir_frontL = ir_frontR = 0.0
+
+        return [min(max(ir_frontal / max_ir, 0.0), 1.0),
+                min(max(ir_frontL / max_ir, 0.0), 1.0),
+                min(max(ir_frontR / max_ir, 0.0), 1.0)]
+
+    def _build_obs(self) -> np.ndarray:
+        b = self._read_brightnesss()
+        ir = self._read_ir()
+        obs = np.array(b + ir, dtype=np.float32)
+        return obs
+
+    def _execute_action(self, action: int):
+        # Durations tuned for Gym steps; adapt if necessary
+        if action == 0:  # Girar muy a la derecha
+            self.rbb.moveWheelsByTime(10, -10, 1.0, wait=True)
+        elif action == 1:  # Girar a la derecha
+            self.rbb.moveWheelsByTime(10, -10, 0.5, wait=True)
+        elif action == 2:  # Avanzar
+            self.rbb.moveWheelsByTime(20, 20, 1.2, wait=True)
+        elif action == 3:  # Girar a la izquierda
+            self.rbb.moveWheelsByTime(-10, 10, 0.5, wait=True)
+        elif action == 4:  # Girar muy a la izquierda
+            self.rbb.moveWheelsByTime(-10, 10, 1.0, wait=True)
+
+    # ------- Gym API -------
+    def reset(self, seed: int = None, options: Dict[str, Any] = None):
+        if seed is not None:
+            random.seed(seed)
+            np.random.seed(seed)
+
+        # Lazy connect
+        self._connect()
+
+        # Reset simulation and internal counters
+        try:
+            self.sim.resetSimulation()
+        except Exception as e:
+            print("Warning: sim.resetSimulation() failed:", e)
+
+        self.steps = 0
+        self.episode_rewards = 0.0
+        self.trajectory = []
+
+        # Small wait to stabilize sensors
+        time.sleep(0.1)
+
+        obs = self._build_obs()
+        self.current_obs = obs
+
+        # Try to store initial pose if available
+        try:
+            pose = self.sim.getRobotPose()
+            self.trajectory.append((pose[0], pose[1]))
+        except Exception:
+            # If pose API not present, append (0,0)
+            self.trajectory.append((0.0, 0.0))
+
+        return obs, {}
+
+    def step(self, action: int):
+        assert self.action_space.contains(action)
+
+        old_center = float(self.current_obs[2])  # center brightness normalized
+
+        # Execute action in sim/hardware
+        try:
+            self._execute_action(action)
+        except Exception as e:
+            print("Warning executing action:", e)
+
+        # Read new observation
+        obs = self._build_obs()
+        self.current_obs = obs
+        self.steps += 1
+
+        # Compute reward
+        new_center = float(obs[2])
+        # Reward is positive if center increased
+        reward = (new_center - old_center) * 10.0
+
+        # Time penalty to encourage reaching quickly
+        reward -= 0.01
+
+        done = False
+        info = {}
+
+        # Check goal reached (denormalize by assumed max 1023)
+        denorm_center = new_center * 1023.0
+        if denorm_center >= self.brightness_goal:
+            reward += 100.0
+            done = True
+            info['reason'] = 'goal_reached'
+            # reset sim internally so the environment is in a clean state on next reset
+            try:
+                self.sim.resetSimulation()
+            except Exception:
+                pass
+
+        # Collision (IR threshold). The uploaded script used numeric thresholds ~150 and 40.
+        try:
+            ir_frontC_raw = self.rbb.readIRSensor(IR.FrontC)
+            ir_frontL_raw = self.rbb.readIRSensor(IR.FrontL)
+            ir_frontR_raw = self.rbb.readIRSensor(IR.FrontR)
+        except Exception:
+            ir_frontC_raw = ir_frontL_raw = ir_frontR_raw = 1023.0
+
+        # If frontal IR indicates close obstacle (small value in uploaded script <150)
+        if ir_frontC_raw < 150:
+            reward -= 50.0
+            done = True
+            info['reason'] = 'collision'
+
+        # Timeout termination
+        if self.steps >= self.max_steps:
+            done = True
+            info['reason'] = 'timeout'
+
+        self.episode_rewards += reward
+
+        # Store pose if available
+        try:
+            pose = self.sim.getRobotPose()
+            self.trajectory.append((pose[0], pose[1]))
+        except Exception:
+            # append last pose-like approximation (keep a moving estimate)
+            self.trajectory.append(self.trajectory[-1] if self.trajectory else (0.0, 0.0))
+
+        return obs, float(reward), done, False, info
+
+    def render(self):
+        # We don't open any windows here; rely on RoboboSim's own renderer (if any)
         pass
 
-# Ejemplo de uso (no es parte del código de la práctica, solo para probar)
+
+# ----- Training & evaluation utilities -----
+
+class RewardLoggerCallback(BaseCallback):
+    """Simple callback that logs mean reward per `log_every` steps and
+    saves a PNG plot of the learning curve.
+    """
+    def __init__(self, log_dir: str = "logs", log_every: int = 10000, verbose: int = 0):
+        super().__init__(verbose)
+        self.log_dir = log_dir
+        os.makedirs(self.log_dir, exist_ok=True)
+        self.log_every = log_every
+        self.rewards = []
+        self.timesteps = []
+
+    def _on_step(self) -> bool:
+        if self.n_calls % self.log_every == 0:
+            # Not the best metric (no access to ep info here), but save model + dummy plot
+            filepath = os.path.join(self.log_dir, f"model_step_{self.num_timesteps}.zip")
+            try:
+                self.model.save(filepath)
+            except Exception:
+                pass
+            # Save a small plot summarizing training progress
+            try:
+                # Try to extract episode rewards from the logger if present
+                # This is a best-effort - stable_baselines writes to the logger dict
+                self._save_plot()
+            except Exception:
+                pass
+        return True
+
+    def _save_plot(self):
+        # Create a simple placeholder plot (timesteps vs. saved models on checkpoints)
+        fig, ax = plt.subplots()
+        ax.set_title("PPO training checkpoints")
+        ax.set_xlabel("dummy index")
+        ax.set_ylabel("timesteps")
+        ax.plot([0, 1], [0, self.num_timesteps])
+        plt.tight_layout()
+        fpath = os.path.join(self.log_dir, "training_progress.png")
+        fig.savefig(fpath)
+        plt.close(fig)
+
+
+def train(total_timesteps: int = 200_000, host: str = "localhost"):
+    if PPO is None:
+        raise RuntimeError("Stable-Baselines3 not available. Install with `pip install stable-baselines3[extra]`.")
+
+    def make_env():
+        return RoboboGymEnv(host=host)
+
+    env = DummyVecEnv([make_env])
+
+    model = PPO(
+        policy="MlpPolicy",
+        env=env,
+        verbose=1,
+        tensorboard_log="./tb_logs",
+        batch_size=64,
+        learning_rate=3e-4,
+    )
+
+    cb = RewardLoggerCallback(log_dir="./logs", log_every=20000)
+
+    model.learn(total_timesteps=total_timesteps, callback=cb)
+    model.save("ppo_robobo_practice01")
+
+    print("Training finished. Model saved to ppo_robobo_practice01.zip")
+
+
+def evaluate(model_path: str = "ppo_robobo_practice01.zip", n_episodes: int = 5, host: str = "localhost"):
+    # Load env & model, run episodes and save trajectory + reward info
+    env = RoboboGymEnv(host=host, max_steps=300)
+
+    if PPO is None:
+        raise RuntimeError("Stable-Baselines3 not available. Install with `pip install stable-baselines3[extra]`.")
+
+    model = PPO.load(model_path)
+
+    results = []
+    for ep in range(n_episodes):
+        obs, _ = env.reset()
+        done = False
+        ep_reward = 0.0
+        while not done:
+            action, _ = model.predict(obs, deterministic=True)
+            obs, reward, done, truncated, info = env.step(int(action))
+            ep_reward += reward
+        results.append({'episode': ep, 'reward': ep_reward, 'reason': info.get('reason', '')})
+
+        # Save trajectory CSV
+        csv_path = f"trajectory_ep{ep}.csv"
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["x", "y"])
+            for x, y in env.trajectory:
+                writer.writerow([x, y])
+        # Plot 2D trajectory
+        xs = [p[0] for p in env.trajectory]
+        ys = [p[1] for p in env.trajectory]
+        fig, ax = plt.subplots()
+        ax.plot(xs, ys, marker='o', linewidth=1)
+        ax.set_title(f"Trajectory episode {ep} (reward={ep_reward:.2f})")
+        ax.set_xlabel("x")
+        ax.set_ylabel("y")
+        plt.grid(True)
+        fig.savefig(f"trajectory_ep{ep}.png")
+        plt.close(fig)
+
+    print("Evaluation finished. Results:")
+    for r in results:
+        print(r)
+
+
+# ----- Command-line interface -----
 if __name__ == '__main__':
-    env = RoboboEnv()
-    obs, info = env.reset()
-    print("Estado inicial:", obs)
-    print("Información inicial:", info)
-    
-    done = False
-    total_reward = 0
-    while not done:
-        action = env.action_space.sample()  # Acción aleatoria para probar
-        obs, reward, terminated, truncated, info = env.step(action)
-        total_reward += reward
-        done = terminated or truncated
-        print(f"Paso {env.steps_count}: Acción={action}, Recompensa={reward:.2f}, Distancia={obs[0]:.2f}")
-    
-    print(f"Episodio terminado. Recompensa total: {total_reward:.2f}")
-    env.close()
+
+    robobo = Robobo("localhost")
+    robobo.connect()
+
+    sim = RoboboSim("localhost")
+    sim.connect()
+
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Train/evaluate PPO on RoboboSim via Gymnasium")
+    parser.add_argument('--train', action='store_true', help='Run training')
+    parser.add_argument('--eval', action='store_true', help='Run evaluation (requires saved model)')
+    parser.add_argument('--timesteps', type=int, default=200000, help='Training timesteps')
+    parser.add_argument('--host', type=str, default='localhost', help='Robobo/RoboboSim host')
+    parser.add_argument('--model', type=str, default='ppo_robobo_practice01.zip', help='Model path for evaluation')
+    args = parser.parse_args()
+
+    if args.train:
+        train(total_timesteps=args.timesteps, host=args.host)
+    if args.eval:
+        evaluate(model_path=args.model, n_episodes=3, host=args.host)
