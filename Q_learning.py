@@ -1,8 +1,6 @@
 from robobopy.Robobo import Robobo
-from robobosim.RoboboSim import RoboboSim
+import gymnasium as gym
 
-robobo = Robobo("localhost")
+robobo = Robobo('localhost')
 robobo.connect()
 
-sim = RoboboSim("localhost")
-sim.connect()
