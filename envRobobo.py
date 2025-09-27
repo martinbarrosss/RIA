@@ -11,7 +11,7 @@ class envRobobo(gym.Env):
         super().__init__()
         self.robobo = Robobo('localhost')
         self.robobo.connect()
-        self.sim = RoboboSim("localhost")
+        self.sim = RoboboSim('localhost')
         self.sim.connect()
 
         # Espacios
@@ -23,16 +23,14 @@ class envRobobo(gym.Env):
         self.max_steps = 50
 
     def step(self, action):
-        # Ejecuta la acción
         if action == 0:
             self.robobo.moveWheelsByTime(25, 25, 1.5)
         elif action == 1:
-            self.robobo.moveWheelsByTime(-5, 25, 1.5)  # giro derecha
+            self.robobo.moveWheelsByTime(-5, 25, 1.5)
         elif action == 2:
-            self.robobo.moveWheelsByTime(25, -5, 1.5)  # giro izquierda
+            self.robobo.moveWheelsByTime(25, -5, 1.5)
         elif action == 3:
-            self.robobo.moveWheelsByDegrees(Wheels.Both, 180, 25)
-        self.sim.wait(1)
+            self.robobo.moveWheelsByTime(24, -24, 1.5)
 
         # Observa estado (maneja el caso de que no haya blob)
         blob = self.robobo.readColorBlob(BlobColor.RED)
@@ -50,7 +48,7 @@ class envRobobo(gym.Env):
             reward = -1
 
         # Terminar episodio si se cumple condición
-        terminated = reward > 0.9
+        terminated = False
 
         # Incrementar contador y truncar si supera el máximo
         self.steps += 1
@@ -61,6 +59,10 @@ class envRobobo(gym.Env):
 
     def reset(self, seed=None, options=None):
         self.sim.resetSimulation()
+        self.robobo.disconnect()
+        self.robobo.connect()
+        self.robobo.moveTiltTo(100, 30, wait=True)  # Espera inicial para asegurar conexión
+
         self.steps = 0
 
         # Leer observación inicial de forma segura
