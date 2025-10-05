@@ -18,6 +18,10 @@ CAMERA_HEIGHT = 100
 CENTER_X = CAMERA_WIDTH / 2.0
 MAX_WHEEL_SPEED = 80
 
+# Parámetros de suavizado / giro
+SMOOTHING_ALPHA = 0.4       # Factor de suavizado (0=no smoothing, 1=no memory)
+MAX_WHEEL_DIFF = 60.0       # Diferencia máxima permitida entre ruedas (reduce giros bruscos)
+
 
 class RoboboFollowerEnv(gym.Env):
     metadata = {"render_modes": ["human"], "render_fps": 30}
@@ -25,6 +29,7 @@ class RoboboFollowerEnv(gym.Env):
     def __init__(self, render_mode=None, debug: bool = False):
         super().__init__()
 
+        # Logger
         self.logger = logging.getLogger("RoboboFollowerEnv")
         handler = logging.StreamHandler()
         formatter = logging.Formatter("[%(levelname)s] %(message)s")
@@ -35,6 +40,7 @@ class RoboboFollowerEnv(gym.Env):
 
         self.logger.info("Inicializando RoboboFollowerEnv (debug=%s)" % debug)
 
+        # Conexiones (Robobo / Sim)
         self.robobo = Robobo('localhost')
         self.sim = RoboboSim('localhost')
 
@@ -46,6 +52,7 @@ class RoboboFollowerEnv(gym.Env):
 
         time.sleep(1.0)
 
+        # Espacios
         self.action_space = gym.spaces.Box(
             low=np.array([-1.0, -1.0], dtype=np.float32), 
             high=np.array([1.0, 1.0], dtype=np.float32), 
@@ -62,7 +69,12 @@ class RoboboFollowerEnv(gym.Env):
         self.max_steps = MAX_STEPS
         self.last_blob_posx = CENTER_X
 
+        # Estados para suavizado de ruedas
+        self.prev_vel_izq = 0.0
+        self.prev_vel_der = 0.0
+
     def _get_observation(self):
+        """Lee el sensor y normaliza la observación. Informa cuando detecta el blob rojo."""
         blob = None
         try:
             blob = self.robobo.readColorBlob(TARGET_BLOB_COLOR)
@@ -74,7 +86,8 @@ class RoboboFollowerEnv(gym.Env):
             posx_norm = (blob.posx - CENTER_X) / CENTER_X  
             proximity_norm = blob.posy / MAX_POSY
             obs = np.array([posx_norm, proximity_norm], dtype=np.float32)
-            self.logger.debug(f"Blob detectado: posx={blob.posx:.1f}, posy={blob.posy:.1f} -> obs={obs.round(3)}")
+            # Mensaje claro cuando detecta el blob rojo
+            self.logger.info(f"Blob rojo detectado: posx={blob.posx:.1f}, posy={blob.posy:.1f} -> obs={obs.round(3)}")
         else:
             obs = np.array([0.0, 0.0], dtype=np.float32)
             self.logger.debug("No se detecta blob: obs=[0.0, 0.0]")
@@ -109,20 +122,51 @@ class RoboboFollowerEnv(gym.Env):
         )
         return total_reward
 
+    def _apply_turn_smoothing(self, desired_l, desired_r):
+        """Aplica límites y suavizado a las velocidades de las ruedas para reducir giros bruscos."""
+        # 1) Limitar la diferencia entre ruedas
+        diff = desired_l - desired_r
+        if abs(diff) > MAX_WHEEL_DIFF:
+            # Reducir el diferencial manteniendo la media
+            mean = (desired_l + desired_r) / 2.0
+            if diff > 0:
+                desired_l = mean + MAX_WHEEL_DIFF / 2.0
+                desired_r = mean - MAX_WHEEL_DIFF / 2.0
+            else:
+                desired_l = mean - MAX_WHEEL_DIFF / 2.0
+                desired_r = mean + MAX_WHEEL_DIFF / 2.0
+            self.logger.debug(f"Limitado diferencial ruedas: nuevo_diff={desired_l - desired_r:.1f}")
+
+        # 2) Suavizado temporal (filtro exponencial simple)
+        smoothed_l = self.prev_vel_izq + SMOOTHING_ALPHA * (desired_l - self.prev_vel_izq)
+        smoothed_r = self.prev_vel_der + SMOOTHING_ALPHA * (desired_r - self.prev_vel_der)
+
+        # Actualizar prev
+        self.prev_vel_izq = smoothed_l
+        self.prev_vel_der = smoothed_r
+
+        return smoothed_l, smoothed_r
+
     def step(self, action):
         self.steps += 1
         action = np.clip(action, self.action_space.low, self.action_space.high)
 
-        vel_izq = float(action[0]) * MAX_WHEEL_SPEED
-        vel_der = float(action[1]) * MAX_WHEEL_SPEED
+        # Escalar a velocidades reales
+        vel_izq_des = float(action[0]) * MAX_WHEEL_SPEED
+        vel_der_des = float(action[1]) * MAX_WHEEL_SPEED
+
+        # Aplicar suavizado y límites a los giros para que no sean bruscos
+        vel_izq, vel_der = self._apply_turn_smoothing(vel_izq_des, vel_der_des)
+
         average_speed = (abs(vel_izq) + abs(vel_der)) / 2.0 
 
-        self.logger.info(f"Paso {self.steps}: Acción={action.round(3)}, vel_izq={vel_izq:.1f}, vel_der={vel_der:.1f}")
+        self.logger.info(f"Paso {self.steps}: Acción(normalizada)={action.round(3)} -> vel_izq={vel_izq:.1f}, vel_der={vel_der:.1f}, avg_speed={average_speed:.1f}")
 
         try:
-            self.robobo.moveWheelsByTime(vel_izq, vel_der, 0.5, wait=False)
-            self.robobo.wait(0.5)  # Espera ampliada de 0.3 a 0.5 segundos
-            time.sleep(0.5)        # Pausa adicional para dar tiempo al simulador
+            # Aumentamos ligeramente la duración para dar tiempo al giro suave
+            self.robobo.moveWheelsByTime(vel_izq, vel_der, 0.6, wait=False)
+            self.robobo.wait(0.6)
+            time.sleep(0.4)  # pequeña pausa extra
         except Exception as e:
             self.logger.warning(f"Error ejecutando movimiento: {e}")
 
@@ -147,6 +191,22 @@ class RoboboFollowerEnv(gym.Env):
         if reward < -8:
             truncated = True
 
+        # Mensajes diagnósticos adicionales
+        if obs[0] == 0.0 and obs[1] == 0.0:
+            self.logger.debug("Diagnóstico: No se ve el blob. Posibles causas: objeto fuera de cámara, iluminación, oculta.")
+
+        if abs(obs[0]) > 0.9:
+            self.logger.debug("Diagnóstico: Blob muy lateralizado (posx cercano a borde). El robot puede necesitar girar más rápido.")
+
+        if reward < 0:
+            try:
+                ir_front = self.robobo.readIRSensor(IR.FrontC)
+                ir_left = self.robobo.readIRSensor(IR.FrontL)
+                ir_right = self.robobo.readIRSensor(IR.FrontR)
+                self.logger.debug(f"Lecturas IR (FrontC, FrontL, FrontR) = ({ir_front}, {ir_left}, {ir_right})")
+            except Exception:
+                pass
+
         return obs, reward, terminated, truncated, info
 
     def reset(self, seed=None, options=None):
@@ -161,7 +221,7 @@ class RoboboFollowerEnv(gym.Env):
         time.sleep(1.5)
 
         try:
-            self.robobo.moveTiltTo(100, 100, wait=True)
+            self.robobo.moveTiltTo(105, 100, wait=True)
             self.robobo.movePanTo(0, 100, wait=True)
             time.sleep(0.8)
 
@@ -190,6 +250,10 @@ class RoboboFollowerEnv(gym.Env):
             except Exception as e2:
                 self.logger.error(f"Reconexión fallida: {e2}")
 
+        # Reiniciar estados de suavizado
+        self.prev_vel_izq = 0.0
+        self.prev_vel_der = 0.0
+
         self.steps = 0
         observation = self._get_observation()
         info = {}
@@ -207,8 +271,9 @@ class RoboboFollowerEnv(gym.Env):
         except Exception:
             pass
 
+
 if __name__ == '__main__':
-    
+
     env = RoboboFollowerEnv(debug=True)
     obs, info = env.reset()
     print("Observación inicial:", obs)
@@ -218,7 +283,7 @@ if __name__ == '__main__':
         obs, reward, terminated, truncated, info = env.step(action)
         print(f"Paso {step+1}: Obs={obs.round(2)}, Reward={reward:.2f}, Terminated={terminated}, Truncated={truncated}")
         if terminated or truncated:
-            print("Episodio finalizado. Reiniciando entorno\n")
+            print("Episodio finalizado. Reiniciando entorno")
             obs, info = env.reset()
             env.robobo.wait(1)
     env.close()

@@ -10,8 +10,8 @@ from stable_baselines3.common.monitor import Monitor
 # --- CONFIGURACIÓN DEL ENTRENAMIENTO ---
 LOG_DIR = "./robobo_logs/"
 MODEL_DIR = "./robobo_models/"
-TOTAL_TIMESTEPS = 100_000 # Número de pasos de tiempo para entrenar [cite: 59]
-SAVE_FREQ = 10_000 # Guardar un checkpoint cada 10,000 pasos
+TOTAL_TIMESTEPS = 10000 # Número de pasos de tiempo para entrenar [cite: 59]
+SAVE_FREQ = 1000 # Guardar un checkpoint cada 10,000 pasos
 
 # Crear directorios si no existen
 os.makedirs(LOG_DIR, exist_ok=True)
