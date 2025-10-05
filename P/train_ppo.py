@@ -5,6 +5,7 @@ from robobo_env import RoboboFollowerEnv
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.callbacks import CheckpointCallback
+from stable_baselines3.common.monitor import Monitor
 
 # --- CONFIGURACIÓN DEL ENTRENAMIENTO ---
 LOG_DIR = "./robobo_logs/"
@@ -18,8 +19,18 @@ os.makedirs(MODEL_DIR, exist_ok=True)
 
 
 # Crear el entorno (Vectorizado)
-# Aunque solo usamos un entorno, make_vec_env maneja correctamente la creación.
-env = make_vec_env(RoboboFollowerEnv, n_envs=1) 
+from stable_baselines3.common.vec_env import VecNormalize, DummyVecEnv
+from stable_baselines3.common.monitor import Monitor
+
+def make_env():
+    def _init():
+        env = RoboboFollowerEnv()
+        return Monitor(env)
+    return _init
+
+env = DummyVecEnv([make_env()])
+env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_reward=10.0)
+
 
 # --- Definición de la Política y el Algoritmo [cite: 44] ---
 # Algoritmo: PPO (sugerido) 
