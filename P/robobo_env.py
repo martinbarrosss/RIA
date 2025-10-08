@@ -22,7 +22,7 @@ MAX_WHEEL_SPEED = 80
 class RoboboFollowerEnv(gym.Env):
     metadata = {"render_modes": ["human"], "render_fps": 30}
 
-    def __init__(self, render_mode=None, debug: bool = False):
+    def __init__(self, render_mode=None, debug: bool = False, discrete_actions: bool = False):
         super().__init__()
 
         self.logger = logging.getLogger("RoboboFollowerEnv")
@@ -33,7 +33,7 @@ class RoboboFollowerEnv(gym.Env):
             self.logger.addHandler(handler)
         self.logger.setLevel(logging.DEBUG if debug else logging.INFO)
 
-        self.logger.info("Inicializando RoboboFollowerEnv (debug=%s)" % debug)
+        self.logger.info(f"Inicializando RoboboFollowerEnv (debug={debug}, discrete_actions={discrete_actions})")
 
         self.robobo = Robobo('localhost')
         self.sim = RoboboSim('localhost')
@@ -44,14 +44,19 @@ class RoboboFollowerEnv(gym.Env):
         except Exception as e:
             self.logger.warning(f"Fallo al conectar al Robobo/Sim: {e}")
 
-        time.sleep(1.0)
+        self.robobo.wait(1.0)
+        self.discrete_actions = discrete_actions
 
-        self.action_space = gym.spaces.Box(
-            low=np.array([-1.0, -1.0], dtype=np.float32), 
-            high=np.array([1.0, 1.0], dtype=np.float32), 
-            dtype=np.float32
-        )
-        
+        # ✅ Elegir espacio de acciones
+        if self.discrete_actions:
+            self.action_space = gym.spaces.Discrete(5)  # 5 acciones discretas
+        else:
+            self.action_space = gym.spaces.Box(
+                low=np.array([-1.0, -1.0], dtype=np.float32), 
+                high=np.array([1.0, 1.0], dtype=np.float32), 
+                dtype=np.float32
+            )
+
         self.observation_space = gym.spaces.Box(
             low=np.array([-1.0, 0.0], dtype=np.float32), 
             high=np.array([1.0, 1.0], dtype=np.float32), 
@@ -99,30 +104,51 @@ class RoboboFollowerEnv(gym.Env):
         except Exception as e:
             self.logger.debug(f"Error leyendo IR: {e}")
 
-        if ir_c > 800: 
-            self.logger.warning(f"IR alto detectado (FrontC={ir_c}) -> Colisión probable. Recompensa -10")
-            return -10.0
-
         total_reward = (centering_reward * 0.1) + (proximity_reward * 0.7) + (movement_reward * 0.2)
         self.logger.debug(
             f"Reward -> centering: {centering_reward:.3f}, proximity: {proximity_reward:.3f}, movement: {movement_reward:.3f}, total: {total_reward:.3f}"
         )
         return total_reward
 
+    def _discrete_to_continuous(self, action):
+        """
+        Convierte una acción discreta (0-2) en velocidades [izq, der] normalizadas entre -1 y 1.
+        """
+        if action == 0:   # avanzar
+            return np.array([0.4, 0.4], dtype=np.float32)
+        elif action == 1: # girar izquierda brusco
+            return np.array([0.5, 0.15], dtype=np.float32)
+        elif action == 2: # girar izquierda suave
+            return np.array([0.4, 0.2], dtype=np.float32)
+        elif action == 3: # girar derecha brusco
+            return np.array([0.2, 0.4], dtype=np.float32)
+        elif action == 4: # girar derecha suave
+            return np.array([0.15, 0.5], dtype=np.float32)
+        else:
+            raise ValueError("Acción discreta fuera de rango")
+
     def step(self, action):
         self.steps += 1
-        action = np.clip(action, self.action_space.low, self.action_space.high)
+
+        # ✅ Traducir acción si es discreta
+        if self.discrete_actions:
+            self.logger.info(f"Paso {self.steps}: Acción discreta={action}")
+            action = self._discrete_to_continuous(action)
+        else:
+            self.logger.info(f"Paso {self.steps}: Acción continua={action.round(3)}")
+
+        # ✅ Aplicar acción continua
+        action = np.clip(action, -1.0, 1.0)
 
         vel_izq = float(action[0]) * MAX_WHEEL_SPEED
         vel_der = float(action[1]) * MAX_WHEEL_SPEED
         average_speed = (abs(vel_izq) + abs(vel_der)) / 2.0 
 
-        self.logger.info(f"Paso {self.steps}: Acción={action.round(3)}, vel_izq={vel_izq:.1f}, vel_der={vel_der:.1f}")
+        self.logger.info(f"Velocidades: izq={vel_izq:.1f}, der={vel_der:.1f}")
 
         try:
             self.robobo.moveWheelsByTime(vel_izq, vel_der, 0.5, wait=False)
-            self.robobo.wait(0.5)  # Espera ampliada de 0.3 a 0.5 segundos
-            time.sleep(0.5)        # Pausa adicional para dar tiempo al simulador
+            self.robobo.wait(0.5)
         except Exception as e:
             self.logger.warning(f"Error ejecutando movimiento: {e}")
 
@@ -132,14 +158,17 @@ class RoboboFollowerEnv(gym.Env):
         proximity_norm = obs[1]
         terminated = False
 
-        if proximity_norm > 0.95:
+        if proximity_norm > 0.99:
             reward += 100.0
             terminated = True
             self.logger.info(f"Éxito: objeto muy cerca (proximity={proximity_norm:.3f}). Episodio terminado.")
 
-        if reward < -8:
+        ir_c = self.robobo.readIRSensor(IR.FrontC)
+        if ir_c > 600:
+            reward = -10.0
             terminated = True
-            self.logger.warning("Terminado por recompensa baja (probable colisión o fallo crítico).")
+            self.logger.warning("COLISIÓN detectada: terminando episodio inmediatamente.")
+
 
         truncated = self.steps >= self.max_steps
         info = {"steps": self.steps}
@@ -172,12 +201,12 @@ class RoboboFollowerEnv(gym.Env):
                 self.logger.debug(f"Error leyendo IR en reset: {e}")
 
             if ir_c > 600:
-                 self.logger.warning("ADVERTENCIA: Iniciando cerca de colisión. Retrocediendo...")
-                 try:
-                     self.robobo.moveWheelsByTime(-20, -20, 0.6, wait=True)
-                 except Exception as e:
-                     self.logger.warning(f"Error retrocediendo durante reset: {e}")
-                 time.sleep(0.6)
+                self.logger.warning("ADVERTENCIA: Iniciando cerca de colisión. Retrocediendo...")
+                try:
+                    self.robobo.moveWheelsByTime(-20, -20, 0.6, wait=True)
+                except Exception as e:
+                    self.logger.warning(f"Error retrocediendo durante reset: {e}")
+                time.sleep(0.6)
 
         except Exception as e:
             self.logger.warning(f"Error al configurar Robobo/Sim durante reset: {e}. Reintentando conexión.")
@@ -207,9 +236,10 @@ class RoboboFollowerEnv(gym.Env):
         except Exception:
             pass
 
+
 if __name__ == '__main__':
-    
-    env = RoboboFollowerEnv(debug=True)
+    # Cambia discrete_actions=True para probar modo discreto
+    env = RoboboFollowerEnv(debug=True, discrete_actions=True)
     obs, info = env.reset()
     print("Observación inicial:", obs)
 

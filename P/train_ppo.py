@@ -24,7 +24,7 @@ from stable_baselines3.common.monitor import Monitor
 
 def make_env():
     def _init():
-        env = RoboboFollowerEnv()
+        env = RoboboFollowerEnv(discrete_actions=True)
         return Monitor(env)
     return _init
 
